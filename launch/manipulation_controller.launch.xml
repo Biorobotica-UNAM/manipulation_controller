@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<launch>
+
+  <group>
+    <push-ros-namespace namespace="manipulation_controller"/>
+
+    <node pkg="manipulation_controller"
+      exec="manipulation_controller_node"
+      name="manipulation_controller_node"
+      output="screen"/>
+  </group>
+
+</launch>
