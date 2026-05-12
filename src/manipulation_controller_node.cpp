@@ -3,6 +3,7 @@
 #include <arms_interfaces/srv/move_arms.hpp>
 #include <torso_interfaces/srv/move_torso.hpp>
 #include <vector>
+#include <cmath> 
 
 using namespace std::chrono_literals;
 
@@ -36,6 +37,9 @@ private:
     rclcpp::Client<arms_interfaces::srv::MoveArms>::SharedPtr                            left_arm_client_;
     rclcpp::Client<torso_interfaces::srv::MoveTorso>::SharedPtr                          torso_client_;
 
+	const int SPEED_MIN  = 5;
+	const int SPEED_MAX  = 20;
+
     void followTrajectoryCallback(
         const std::shared_ptr<manipulation_controller_interfaces::srv::FollowTrajectory::Request> request,
         std::shared_ptr<manipulation_controller_interfaces::srv::FollowTrajectory::Response> response)
@@ -57,6 +61,25 @@ private:
         size_t num_blocks = request->waypoints.size() / BLOCK_SIZE;
         RCLCPP_INFO(this->get_logger(), "Executing trajectory with %zu blocks", num_blocks);
 
+		std::vector<double> cumulative_dist(num_blocks, 0.0);
+		for (size_t block = 1; block < num_blocks; block++)
+		{
+		    size_t prev = (block - 1) * BLOCK_SIZE;
+		    size_t curr =  block      * BLOCK_SIZE;
+		    double max_delta = 0.0;
+		    for (size_t j = 1; j < BLOCK_SIZE; j++)
+		    {
+		        double delta = std::abs(request->waypoints[curr + j] - request->waypoints[prev + j]);
+		        max_delta = std::max(max_delta, delta);
+		    }
+		    cumulative_dist[block] = cumulative_dist[block - 1] + max_delta;
+		}
+		double total_dist = cumulative_dist[num_blocks - 1];
+
+		auto quintic = [](double s) -> double {
+		    return s * s * s * (6.0 * s * s - 15.0 * s + 10.0);
+		};
+
         for (size_t block = 0; block < num_blocks; block++)
         {
             double torso_position = request->waypoints[block * BLOCK_SIZE];
@@ -76,8 +99,21 @@ private:
             auto torso_req = std::make_shared<torso_interfaces::srv::MoveTorso::Request>();
             torso_req->position = torso_position;
 
+			int arm_speed;
+			if (num_blocks == 1 || total_dist < 1e-6)
+			{
+				arm_speed = SPEED_MAX;
+			}
+			else
+			{
+				double s   = cumulative_dist[block] / total_dist;
+				double vel = quintic(s);
+				arm_speed = SPEED_MIN + static_cast<int>(vel * (SPEED_MAX - SPEED_MIN));
+			}
+
             auto arm_req = std::make_shared<arms_interfaces::srv::MoveArms::Request>();
-            arm_req->positions = arm_positions;
+			arm_req->positions = arm_positions;
+			arm_req->speed     = arm_speed;
 
             auto torso_future = torso_client_->async_send_request(torso_req);
             auto arm_future   = arm_client->async_send_request(arm_req);
