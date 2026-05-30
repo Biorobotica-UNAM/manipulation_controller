@@ -38,7 +38,7 @@ private:
     rclcpp::Client<torso_interfaces::srv::MoveTorso>::SharedPtr                          torso_client_;
 
 	const int SPEED_MIN  = 5;
-	const int SPEED_MAX  = 20;
+	const int SPEED_MAX  = 50;
 
     void followTrajectoryCallback(
         const std::shared_ptr<manipulation_controller_interfaces::srv::FollowTrajectory::Request> request,
