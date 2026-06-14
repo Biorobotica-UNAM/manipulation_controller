@@ -100,7 +100,7 @@ private:
             torso_req->position = torso_position;
 
 			int arm_speed;
-			if (num_blocks == 1 || total_dist < 1e-6)
+			if (block == 0 || num_blocks == 1 || total_dist < 1e-6)
 			{
 				arm_speed = SPEED_MAX;
 			}
