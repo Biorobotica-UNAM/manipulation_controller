@@ -2,8 +2,6 @@
 #include <manipulation_controller_interfaces/srv/follow_trajectory.hpp>
 #include <arms_interfaces/srv/move_arms.hpp>
 #include <torso_interfaces/srv/move_torso.hpp>
-#include <algorithm>
-#include <string>
 #include <vector>
 #include <cmath> 
 
@@ -39,14 +37,13 @@ private:
     rclcpp::Client<arms_interfaces::srv::MoveArms>::SharedPtr                            left_arm_client_;
     rclcpp::Client<torso_interfaces::srv::MoveTorso>::SharedPtr                          torso_client_;
 
-	const int SPEED_MIN  = 5;
-	const int SPEED_MAX  = 50;
+	const int SPEED_MAX = 50;
 
     void followTrajectoryCallback(
         const std::shared_ptr<manipulation_controller_interfaces::srv::FollowTrajectory::Request> request,
         std::shared_ptr<manipulation_controller_interfaces::srv::FollowTrajectory::Response> response)
     {
-        auto &arm_client = (request->planning_group == "right_arm_group") ? right_arm_client_ : left_arm_client_;
+        auto &arm_client_ = (request->planning_group == "right_arm_group") ? right_arm_client_ : left_arm_client_;
 
         const size_t DOF_TORSO  = 1;
         const size_t DOF_ARM    = 6;
@@ -61,127 +58,95 @@ private:
         }
 
         size_t num_blocks = request->waypoints.size() / BLOCK_SIZE;
-        if (num_blocks == 0) {
-            RCLCPP_ERROR(this->get_logger(), "Trajectory request has no blocks");
-            response->success = false;
-            response->message = "Empty trajectory";
-            return;
-        }
-
         RCLCPP_INFO(this->get_logger(), "Executing trajectory with %zu blocks", num_blocks);
 
-		std::vector<double> cumulative_dist(num_blocks, 0.0);
-		for (size_t block = 1; block < num_blocks; block++)
+		if (num_blocks == 0)
 		{
-		    size_t prev = (block - 1) * BLOCK_SIZE;
-		    size_t curr =  block      * BLOCK_SIZE;
-		    double max_delta = 0.0;
-		    for (size_t j = 1; j < BLOCK_SIZE; j++)
-		    {
-		        double delta = std::abs(request->waypoints[curr + j] - request->waypoints[prev + j]);
-		        max_delta = std::max(max_delta, delta);
-		    }
-		    cumulative_dist[block] = cumulative_dist[block - 1] + max_delta;
+			response->success = true;
+			response->message = "Empty trajectory";
+			return;
 		}
-		double total_dist = cumulative_dist[num_blocks - 1];
 
-		auto quintic = [](double s) -> double {
-		    return s * s * s * (6.0 * s * s - 15.0 * s + 10.0);
-		};
+		if (!torso_client_->wait_for_service(5s))
+		{
+			response->success = false;
+			response->message = "Torso service unavailable";
+			return;
+		}
 
-        for (size_t block = 0; block < num_blocks; block++)
+		if (!arm_client_->wait_for_service(5s))
+		{
+			response->success = false;
+			response->message = "Arm service unavailable";
+			return;
+		}
+
+        constexpr size_t STEP = 2;
+
+		for (size_t block = 0; block < num_blocks; block += STEP)
         {
             double torso_position = request->waypoints[block * BLOCK_SIZE];
             std::vector<double> arm_positions(
                 request->waypoints.begin() + block * BLOCK_SIZE + 1,
                 request->waypoints.begin() + (block + 1) * BLOCK_SIZE);
 
-            if (!torso_client_->wait_for_service(1s)) {
-                response->success = false;
-                response->message = "Torso service unavailable at block " + std::to_string(block);
-                RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
-                return;
-            }
-            if (!arm_client->wait_for_service(1s)) {
-                response->success = false;
-                response->message = "Arm service unavailable at block " + std::to_string(block);
-                RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
-                return;
-            }
-
             auto torso_req = std::make_shared<torso_interfaces::srv::MoveTorso::Request>();
             torso_req->position = torso_position;
 
-			int arm_speed;
-			if (block == 0 || num_blocks == 1 || total_dist < 1e-6)
-			{
-				arm_speed = SPEED_MAX;
-			}
-			else
-			{
-				double s   = cumulative_dist[block] / total_dist;
-				double vel = quintic(s);
-				arm_speed = SPEED_MIN + static_cast<int>(vel * (SPEED_MAX - SPEED_MIN));
-			}
-
-            auto arm_req = std::make_shared<arms_interfaces::srv::MoveArms::Request>();
+			auto arm_req = std::make_shared<arms_interfaces::srv::MoveArms::Request>();
 			arm_req->positions = arm_positions;
-			arm_req->speed     = arm_speed;
+			arm_req->speed = SPEED_MAX;
 
             auto torso_future = torso_client_->async_send_request(torso_req);
-            auto arm_future   = arm_client->async_send_request(arm_req);
+            auto arm_future   = arm_client_->async_send_request(arm_req);
 
             auto torso_status = cb_executor_->spin_until_future_complete(torso_future, 5s);
             auto arm_status   = cb_executor_->spin_until_future_complete(arm_future,   5s);
-
-            // Cada bloque se considera atomico: torso y brazo deben terminar
-            // correctamente. Si cualquiera falla, el servicio completo debe
-            // responder success=false para que Take no continue como si la
-            // trayectoria hubiera sido ejecutada.
-            bool block_ok = true;
-            std::string block_error;
 
             if (torso_status == rclcpp::FutureReturnCode::SUCCESS) {
                 auto result = torso_future.get();
                 if (result->success)
                     RCLCPP_INFO(this->get_logger(), "[Block %zu] Torso OK: %s", block, result->message.c_str());
-                else {
+                else
                     RCLCPP_WARN(this->get_logger(), "[Block %zu] Torso failed: %s", block, result->message.c_str());
-                    block_ok = false;
-                    block_error += "torso failed: " + result->message + "; ";
-                }
             } else {
                 RCLCPP_ERROR(this->get_logger(), "[Block %zu] Torso timed out", block);
-                block_ok = false;
-                block_error += "torso timed out; ";
             }
 
             if (arm_status == rclcpp::FutureReturnCode::SUCCESS) {
                 auto result = arm_future.get();
                 if (result->success)
                     RCLCPP_INFO(this->get_logger(), "[Block %zu] Arm OK: %s", block, result->message.c_str());
-                else {
+                else
                     RCLCPP_WARN(this->get_logger(), "[Block %zu] Arm failed: %s", block, result->message.c_str());
-                    block_ok = false;
-                    block_error += "arm failed: " + result->message + "; ";
-                }
             } else {
                 RCLCPP_ERROR(this->get_logger(), "[Block %zu] Arm timed out", block);
-                block_ok = false;
-                block_error += "arm timed out; ";
-            }
-
-            if (!block_ok) {
-                // Regresamos el primer bloque fallido con el detalle acumulado.
-                // Esto evita el falso positivo "Trajectory executed" cuando un
-                // motor, torso o servicio de brazo fallo a mitad del camino.
-                response->success = false;
-                response->message =
-                    "Trajectory failed at block " + std::to_string(block) + ": " + block_error;
-                RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
-                return;
             }
         }
+
+		if ((num_blocks - 1) % STEP != 0)
+		{
+			size_t block = num_blocks - 1;
+
+			double torso_position = request->waypoints[block * BLOCK_SIZE];
+
+			std::vector<double> arm_positions(
+				request->waypoints.begin() + block * BLOCK_SIZE + 1,
+				request->waypoints.begin() + (block + 1) * BLOCK_SIZE);
+
+			auto torso_req = std::make_shared<torso_interfaces::srv::MoveTorso::Request>();
+			torso_req->position = torso_position;
+
+			auto arm_req = std::make_shared<arms_interfaces::srv::MoveArms::Request>();
+			arm_req->positions = arm_positions;
+			arm_req->speed = SPEED_MAX;
+
+			auto torso_future = torso_client_->async_send_request(torso_req);
+			auto arm_future = arm_client_->async_send_request(arm_req);
+
+			cb_executor_->spin_until_future_complete(torso_future, 5s);
+			cb_executor_->spin_until_future_complete(arm_future, 5s);
+		}
 
         response->success = true;
         response->message = "Trajectory executed";
