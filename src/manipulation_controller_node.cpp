@@ -2,6 +2,8 @@
 #include <manipulation_controller_interfaces/srv/follow_trajectory.hpp>
 #include <arms_interfaces/srv/move_arms.hpp>
 #include <torso_interfaces/srv/move_torso.hpp>
+#include <algorithm>
+#include <string>
 #include <vector>
 #include <cmath> 
 
@@ -59,6 +61,13 @@ private:
         }
 
         size_t num_blocks = request->waypoints.size() / BLOCK_SIZE;
+        if (num_blocks == 0) {
+            RCLCPP_ERROR(this->get_logger(), "Trajectory request has no blocks");
+            response->success = false;
+            response->message = "Empty trajectory";
+            return;
+        }
+
         RCLCPP_INFO(this->get_logger(), "Executing trajectory with %zu blocks", num_blocks);
 
 		std::vector<double> cumulative_dist(num_blocks, 0.0);
@@ -88,12 +97,16 @@ private:
                 request->waypoints.begin() + (block + 1) * BLOCK_SIZE);
 
             if (!torso_client_->wait_for_service(1s)) {
-                RCLCPP_ERROR(this->get_logger(), "[Block %zu] Torso service unavailable, skipping", block);
-                continue;
+                response->success = false;
+                response->message = "Torso service unavailable at block " + std::to_string(block);
+                RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+                return;
             }
             if (!arm_client->wait_for_service(1s)) {
-                RCLCPP_ERROR(this->get_logger(), "[Block %zu] Arm service unavailable, skipping", block);
-                continue;
+                response->success = false;
+                response->message = "Arm service unavailable at block " + std::to_string(block);
+                RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+                return;
             }
 
             auto torso_req = std::make_shared<torso_interfaces::srv::MoveTorso::Request>();
@@ -121,24 +134,52 @@ private:
             auto torso_status = cb_executor_->spin_until_future_complete(torso_future, 5s);
             auto arm_status   = cb_executor_->spin_until_future_complete(arm_future,   5s);
 
+            // Cada bloque se considera atomico: torso y brazo deben terminar
+            // correctamente. Si cualquiera falla, el servicio completo debe
+            // responder success=false para que Take no continue como si la
+            // trayectoria hubiera sido ejecutada.
+            bool block_ok = true;
+            std::string block_error;
+
             if (torso_status == rclcpp::FutureReturnCode::SUCCESS) {
                 auto result = torso_future.get();
                 if (result->success)
                     RCLCPP_INFO(this->get_logger(), "[Block %zu] Torso OK: %s", block, result->message.c_str());
-                else
+                else {
                     RCLCPP_WARN(this->get_logger(), "[Block %zu] Torso failed: %s", block, result->message.c_str());
+                    block_ok = false;
+                    block_error += "torso failed: " + result->message + "; ";
+                }
             } else {
                 RCLCPP_ERROR(this->get_logger(), "[Block %zu] Torso timed out", block);
+                block_ok = false;
+                block_error += "torso timed out; ";
             }
 
             if (arm_status == rclcpp::FutureReturnCode::SUCCESS) {
                 auto result = arm_future.get();
                 if (result->success)
                     RCLCPP_INFO(this->get_logger(), "[Block %zu] Arm OK: %s", block, result->message.c_str());
-                else
+                else {
                     RCLCPP_WARN(this->get_logger(), "[Block %zu] Arm failed: %s", block, result->message.c_str());
+                    block_ok = false;
+                    block_error += "arm failed: " + result->message + "; ";
+                }
             } else {
                 RCLCPP_ERROR(this->get_logger(), "[Block %zu] Arm timed out", block);
+                block_ok = false;
+                block_error += "arm timed out; ";
+            }
+
+            if (!block_ok) {
+                // Regresamos el primer bloque fallido con el detalle acumulado.
+                // Esto evita el falso positivo "Trajectory executed" cuando un
+                // motor, torso o servicio de brazo fallo a mitad del camino.
+                response->success = false;
+                response->message =
+                    "Trajectory failed at block " + std::to_string(block) + ": " + block_error;
+                RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+                return;
             }
         }
 
