@@ -81,9 +81,7 @@ private:
 			return;
 		}
 
-        constexpr size_t STEP = 2;
-
-		for (size_t block = 0; block < num_blocks; block += STEP)
+		for (size_t block = 0; block < num_blocks; block++)
         {
             double torso_position = request->waypoints[block * BLOCK_SIZE];
             std::vector<double> arm_positions(
@@ -123,30 +121,6 @@ private:
                 RCLCPP_ERROR(this->get_logger(), "[Block %zu] Arm timed out", block);
             }
         }
-
-		if ((num_blocks - 1) % STEP != 0)
-		{
-			size_t block = num_blocks - 1;
-
-			double torso_position = request->waypoints[block * BLOCK_SIZE];
-
-			std::vector<double> arm_positions(
-				request->waypoints.begin() + block * BLOCK_SIZE + 1,
-				request->waypoints.begin() + (block + 1) * BLOCK_SIZE);
-
-			auto torso_req = std::make_shared<torso_interfaces::srv::MoveTorso::Request>();
-			torso_req->position = torso_position;
-
-			auto arm_req = std::make_shared<arms_interfaces::srv::MoveArms::Request>();
-			arm_req->positions = arm_positions;
-			arm_req->speed = SPEED_MAX;
-
-			auto torso_future = torso_client_->async_send_request(torso_req);
-			auto arm_future = arm_client_->async_send_request(arm_req);
-
-			cb_executor_->spin_until_future_complete(torso_future, 5s);
-			cb_executor_->spin_until_future_complete(arm_future, 5s);
-		}
 
         response->success = true;
         response->message = "Trajectory executed";
